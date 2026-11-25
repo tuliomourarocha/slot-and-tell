@@ -1,15 +1,19 @@
 -- Issue #6 · S1 — Schema base multi-tenant do Agenda SaaS (slot-and-tell)
 -- Escopo: 10 tabelas núcleo, FKs compostas com tenant_id (isolamento no banco),
 -- UUIDs, timestamps de auditoria, trigger updated_at, exclusão GiST para
--- conflitos de reservas ativas via tstzrange '[)' e snapshots de serviço.
--- Fora deste escopo (issues próprias): RLS (#3), login (#5), portal (#2), CI (#13),
--- RPCs/mutations transacionais e tabelas WhatsApp.
+-- conflitos de reservas ativas via tstzrange '[)', snapshots de serviço e
+-- acesso deny-by-default (RLS ligado sem políticas + revoke de anon/authenticated).
+-- Fora deste escopo (issues próprias): políticas de RLS (#3), login (#5), portal (#2),
+-- CI (#13), RPCs/mutations transacionais e tabelas WhatsApp.
 
 -- ---------------------------------------------------------------------------
 -- Extensões
 -- ---------------------------------------------------------------------------
--- btree_gist: permite EXCLUDE USING gist combinando igualdade de UUID com
--- sobreposição de intervalo (regra de conflito de agenda).
+-- btree_gist: contrib oficial do PostgreSQL, suportada pelo Supabase (Cloud e
+-- stack local), que permite EXCLUDE USING gist combinando igualdade de UUID com
+-- sobreposição de intervalo (regra de conflito de agenda). Instalada no schema
+-- `extensions` (padrão Supabase); em PostgreSQL puro exige superuser e que o
+-- schema exista. Não há dependência de extensões experimentais.
 create extension if not exists btree_gist with schema extensions;
 
 -- ---------------------------------------------------------------------------
@@ -48,6 +52,11 @@ create table public.tenants (
   -- janela de cancelamento autônomo (minutos de antecedência)
   cancellation_cutoff_minutes int not null default 120
     check (cancellation_cutoff_minutes >= 0),
+  -- ciclo de vida do tenant: 'archived' é o caminho de saída — a operação
+  -- padrão é arquivar, nunca excluir (histórico em audit_events é restrict).
+  -- Exclusão física de tenant é procedimento manual offline fora do MVP.
+  status text not null default 'active'
+    check (status in ('active', 'archived')),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   unique (id, name)
@@ -101,7 +110,8 @@ create table public.memberships (
   user_id uuid not null references auth.users (id) on delete cascade,
   role text not null
     check (role in ('admin', 'receptionist', 'professional')),
-  -- profissional vinculado (opcional). Se presente, deve pertencer ao mesmo tenant
+  -- profissional vinculado. Papel 'professional' exige vínculo e nenhum outro
+  -- papel pode apontar para um profissional da agenda
   professional_id uuid,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
@@ -109,11 +119,16 @@ create table public.memberships (
   foreign key (tenant_id, professional_id)
     references public.professionals (tenant_id, id) on delete restrict,
   unique (tenant_id, user_id),
-  constraint memberships_professional_requires_role
-    check (professional_id is null or role = 'professional')
+  constraint memberships_role_professional_pairing
+    check ((role = 'professional') = (professional_id is not null))
 );
 
 create index memberships_user_idx on public.memberships (user_id);
+
+-- cardinalidade: um profissional da agenda é representado por no máximo um login
+create unique index memberships_professional_unique_idx
+  on public.memberships (tenant_id, professional_id)
+  where professional_id is not null;
 
 -- ---------------------------------------------------------------------------
 -- professional_services — profissionais habilitados por serviço
@@ -227,6 +242,9 @@ create table public.appointments (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   check (ends_at > starts_at),
+  -- o snapshot de duração deve bater com o intervalo gravado na reserva
+  constraint appointments_duration_matches_range
+    check ((ends_at - starts_at) = make_interval(mins => service_duration_minutes)),
   -- isolamento entre tenants em todas as referências da reserva
   foreign key (tenant_id, customer_id)
     references public.customers (tenant_id, id) on delete restrict,
@@ -253,11 +271,45 @@ create index appointments_customer_idx
 -- ---------------------------------------------------------------------------
 -- audit_events — trilha append-only (autor, empresa, entidade, operação, mudanças)
 -- ---------------------------------------------------------------------------
+-- Gate de imutabilidade: UPDATE/DELETE rejeitados por trigger de linha e
+-- TRUNCATE rejeitado por trigger de statement. A trilha só cresce; correções
+-- entram como novo evento. (Dono/migração pode remover os triggers — mudança de
+-- schema é ato deliberado e auditável, não caminho de app.)
+--
+-- Política de PII em `changes` (revisão #6, decisão documentada):
+-- (1) conteúdo mínimo — registrar apenas o delta necessário para reconstruir a
+-- mutação (ex.: {"archived_at": ...}), nunca payloads livres de conversa,
+-- documentos ou cópias inteiras de linha;
+-- (2) referenciar por id — contatos de cliente (telefone/e-mail) entram como
+-- customer_id, nunca inline;
+-- (3) retenção e acesso — leitura da trilha é papel de admin e será definida
+-- pelas políticas de RLS da issue #3; expurgo por LGPD é operação offline de
+-- dono (remove o gate primeiro), fora do MVP. A RPC de escrita da issue da
+-- agenda deve impor (1)/(2) na fonte.
+create or replace function public.audit_events_reject_mutation()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+  raise exception 'audit_events é append-only: % não é permitido', TG_OP
+    using errcode = '42501';
+end;
+$$;
+
 create table public.audit_events (
   id uuid primary key default gen_random_uuid(),
-  tenant_id uuid not null references public.tenants (id) on delete cascade,
-  -- autor da ação: usuário do Auth (equipe), agente do sistema, ou nulo quando automático
-  actor_user_id uuid references auth.users (id) on delete set null,
+  -- restrict: excluir um tenant com histórico registrado exige arquivamento
+  -- deliberado da empresa, nunca cascade silencioso que apagaria a trilha
+  tenant_id uuid not null references public.tenants (id) on delete restrict,
+  -- autor da ação: usuário do Auth (equipe), agente do sistema, ou nulo quando automático.
+  -- restrict (e não set null): UPDATE set null em audit_events é rejeitado pelo
+  -- gate append-only, então a FK antiga (on delete set null) faria a exclusão do
+  -- usuário falhar de qualquer jeito — com erro confuso de trigger no lugar de
+  -- erro claro de FK. Excluir usuário com trilha exige procedimento manual
+  -- deliberado (a trilha é o motivo de existir); `actor_kind = 'system'` cobre
+  -- ações sem autor humano.
+  actor_user_id uuid references auth.users (id) on delete restrict,
   actor_kind text not null default 'system'
     check (actor_kind in ('team', 'agent', 'system')),
   entity_type text not null
@@ -274,6 +326,16 @@ create index audit_events_tenant_time_idx
 
 create index audit_events_entity_idx
   on public.audit_events (tenant_id, entity_type, entity_id);
+
+create trigger audit_events_append_only
+  before update or delete on public.audit_events
+  for each row execute function public.audit_events_reject_mutation();
+
+-- TRUNCATE não dispara triggers de linha: gate separado a nível de statement.
+-- Sem isto, `truncate audit_events` limparia a trilha sem passar pelo gate.
+create trigger audit_events_reject_truncate
+  before truncate on public.audit_events
+  for each statement execute function public.audit_events_reject_mutation();
 
 -- ---------------------------------------------------------------------------
 -- Triggers updated_at
@@ -311,15 +373,61 @@ create trigger appointments_set_updated_at
   for each row execute function public.set_updated_at();
 
 -- ---------------------------------------------------------------------------
+-- Acesso negado por padrão (até a issue #3 definir políticas por papel)
+-- ---------------------------------------------------------------------------
+-- RLS habilitado em todas as 10 tabelas SEM nenhuma política: qualquer papel
+-- sem BYPASSRLS (anon, authenticated) não lê nem escreve nada — inclusive se
+-- chaves vazarem para um projeto remoto antes de #3. O revoke abaixo é a
+-- segunda camada (defesa em profundidade: sem GRANT nem precisaria de política).
+-- service_role/dono continuam com acesso para o servidor e migrações.
+alter table public.tenants              enable row level security;
+alter table public.professionals        enable row level security;
+alter table public.services             enable row level security;
+alter table public.memberships          enable row level security;
+alter table public.professional_services enable row level security;
+alter table public.weekly_availability  enable row level security;
+alter table public.schedule_exceptions  enable row level security;
+alter table public.customers            enable row level security;
+alter table public.appointments         enable row level security;
+alter table public.audit_events         enable row level security;
+
+-- sem permissões de objeto para os papéis expostos pela API pública
+revoke all on all tables in schema public from anon, authenticated;
+
+-- funções do schema public (set_updated_at, gates de auditoria) também nascem
+-- sem EXECUTE para os papéis da API pública — RPCs futuras da agenda serão
+-- concedidas explicitamente junto das políticas na issue #3
+revoke execute on all functions in schema public from anon, authenticated;
+
+-- futuras tabelas do schema public (portal, agenda, WhatsApp) nascem negadas
+-- até #3 e afins conceder GRANTs explícitos junto das políticas
+alter default privileges in schema public revoke all on tables from anon, authenticated;
+alter default privileges in schema public revoke all on functions from anon, authenticated;
+
+-- ---------------------------------------------------------------------------
 -- Comentários (documentação embutida no schema)
 -- ---------------------------------------------------------------------------
 comment on table public.tenants is
-  'Empresa/unidade atendida. MVP: uma unidade por tenant. Fuso IANA, moeda e políticas de agendamento.';
+  'Empresa/unidade atendida. MVP: uma unidade por tenant. Fuso IANA, moeda e políticas de agendamento. Ciclo de vida: status active → archived (path oficial de saída; exclusão física não é fluxo de produto — FKs de histórico são restrict).';
 comment on table public.memberships is
   'Vínculo entre usuário do Supabase Auth, empresa, papel e profissional opcional. FK composta impede vínculo entre tenants.';
+comment on table public.professional_services is
+  'Habilitações serviço ↔ profissional, isoladas por tenant via FK composta.';
+comment on constraint appointments_no_active_overlap on public.appointments is
+  'Regra de conflito: nenhum par de reservas pending/confirmed do mesmo profissional pode sobrepor. Adjacência [) é permitida.';
+comment on constraint appointments_duration_matches_range on public.appointments is
+  'Consistência do snapshot: duração gravada na reserva é exatamente ends_at - starts_at.';
+-- Decisão (revisão #6): NÃO há FK de appointments para professional_services.
+-- Motivos: (1) habilitações são mutáveis ao longo do tempo e a reserva guarda
+-- snapshot do catálogo — uma FK impediria remover habilitação de um serviço já
+-- reservado; (2) o snapshot de nome/duração/preço já torna a reserva independente
+-- do catálogo; (3) a validação "profissional pode fazer este serviço" é regra de
+-- negócio do agendamento e será imposta na RPC transacional da issue da agenda.
+-- O vínculo estrutural existente (tenant_id, service_id) → services e
+-- (tenant_id, professional_id) → professionals garante isolamento entre empresas.
 comment on table public.appointments is
   'Reservas com snapshots de catálogo. Conflito de agenda por EXCLUDE GiST em (tenant, profissional, tstzrange "[)")) nas reservas ativas. RPCs transacionais virão na issue da agenda.';
 comment on column services.price_cents is
   'Preço em unidades monetárias mínimas (centavos de BRL no seed).';
 comment on table public.audit_events is
-  'Trilha append-only de mutações. Escrita junto da mutação na mesma transação (RPCs futuras).';
+  'Trilha append-only de mutações: UPDATE/DELETE rejeitados por trigger de linha e TRUNCATE por trigger de statement; tenant e autor com histórico têm FK restrict (nada de cascade/anulação silenciosa). `changes` segue política de PII mínima (delta só, contatos por id). Escrita junto da mutação na mesma transação (RPCs futuras).';

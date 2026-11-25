@@ -2,7 +2,7 @@
 
 Agendamento multiempresa para barbearias, salões, estúdios e clínicas, com portal web e atendimento por WhatsApp. Especificação completa em [`spec.md`](./spec.md).
 
-Este estado do repositório corresponde à **Fase 1 · Fundação (issue #1)**: projeto Next.js + TypeScript com estrutura de módulos. Ainda não há funcionalidade de produto.
+Este estado do repositório corresponde à **Fase 1 · Fundação**: scaffold Next.js + TypeScript (issue #1) e schema base do banco com seed multi-tenant (issue #6). Ainda não há funcionalidade de produto.
 
 ## Requisitos
 
@@ -85,7 +85,13 @@ Migrations versionadas em `supabase/migrations/` e seed de desenvolvimento em `s
 | `appointments` | Reservas em `timestamptz` com `tstzrange '[)'`, snapshots de serviço e exclusão GiST contra overlap de reservas ativas (`pending`/`confirmed`) |
 | `audit_events` | Trilha append-only de mutações |
 
-Isolamento entre tenants é garantido no banco por FKs compostas `(tenant_id, id)`: uma reserva ou vínculo jamais referencia cliente, profissional ou serviço de outra empresa. RLS será adicionado na issue #3 — até lá, o schema atende apenas desenvolvimento local.
+Isolamento entre tenants é garantido no banco por FKs compostas `(tenant_id, id)`: uma reserva ou vínculo jamais referencia cliente, profissional ou serviço de outra empresa.
+
+### Política de acesso (RLS)
+
+A migration já deixa as 10 tabelas em **deny-by-default**: RLS habilitado sem nenhuma política e `revoke all` de `anon`/`authenticated` (com `alter default privileges` negando também as tabelas futuras do schema). Ou seja, mesmo antes da issue #3 as chaves expostas ao navegador (`anon`) não leem nem escrevem nada — e `service_role` (servidor) mantém o acesso legítimo. As **políticas por papel** (admin/recepção/profissional e acesso do portal) chegam na **issue #3**, que adicionará `GRANT`+policies juntos; até lá não há superfície exposta a fechar.
+
+Regras estruturais já fixadas nesta migration: `audit_events` é append-only (trigger rejeita UPDATE/DELETE e `tenant_id` tem `on delete restrict`, sem cascade silencioso do histórico); `memberships` pareia papel e profissional em ambos os sentidos com no máximo um login por profissional; o snapshot de duração em `appointments` é checado contra `ends_at - starts_at`; e `btree_gist` (extensão oficial usada pelo `EXCLUDE` de conflito) é suportada pelo Supabase, instalada no schema `extensions`.
 
 ### subir e resetar o banco local
 
@@ -98,6 +104,8 @@ supabase db reset       # aplica migrations + seed (duas empresas de exemplo)
 A saída de `supabase start` lista as credenciais locais (Studio, URL do Postgres, chaves `anon`/`service_role` de desenvolvimento) — nada disso é versionado.
 
 ### Seed: duas empresas de exemplo
+
+Política do seed: é **local/DEV only** e **idempotente**. (a) Guarda no topo do arquivo aborta conexões cujo servidor não seja loopback — `supabase start`/`db reset` rodam via socket/`127.0.0.1` e passam; apontar um `psql` com connection string remota para reaplicar o arquivo é bloqueado (túnel para produção ainda é responsabilidade de quem executa). (b) Reaplicar sobre banco já semeado não duplica nem erra: `on conflict do nothing` com UUIDs/chaves naturais determinísticas em todas as tabelas e `NOT EXISTS` onde não há chave natural (expediente, exceções). Como as datas de exceções/reservas são relativas a "hoje" e não são re-ancoradas em reaplicação, use `supabase db reset` para re-gerar o seed com a data atual.
 
 - **Barbearia Vila Nova** — passo 15 min, cancelamento 120 min; 3 profissionais (Marina não tem login), 4 serviços (1 arquivado), expediente seg–sáb com pausa, exceções de folga/bloqueio/extra, 3 clientes e 5 reservas (inclui par adjacente 10:00–10:40 e 10:40–11:10).
 - **Clínica Bem Estar** — passo 30 min, cancelamento 1440 min; 2 profissionais, 3 serviços, expediente seg–sex, 2 clientes e 2 reservas.
@@ -117,7 +125,7 @@ Usuários de desenvolvimento (senha fixa `slot-and-tell-dev`, **somente stack lo
 supabase test db        # pgTAP: supabase/tests/database/schema_seed.test.sql
 ```
 
-Os testes cobrem o DoD da issue #6: aplicação das migrations, seed com 2 empresas em BRL/`America/Sao_Paulo`, rejeição de FK cruzada entre tenants, rejeição de overlap em reservas ativas, aceitação de intervalos adjacentes `[)`, `trigger updated_at` e unicidade de contato por empresa.
+Os 23 asserts cobrem o DoD da issue #6: aplicação das migrations, seed com 2 empresas em BRL/`America/Sao_Paulo`, rejeição de FK cruzada entre tenants, rejeição de overlap em reservas ativas, aceitação de intervalos adjacentes `[)`, `trigger updated_at`, unicidade de contato por empresa, snapshot de duração consistente, acesso deny-by-default (RLS nas 10 tabelas, zero políticas, zero grants para `anon`/`authenticated`) e trilha `audit_events` imutável. Os testes são **transacionais e repetíveis**: o arquivo abre `BEGIN` e encerra com `ROLLBACK` após `finish()`, então nenhum insert/update dos testes persiste — `supabase test db` pode rodar em sequência sem `db reset` no meio.
 
 ## Validação do webhook da Meta e Supabase
 

@@ -3,9 +3,28 @@
 -- Execute com: supabase db reset && supabase test db
 -- Cobre: 10 tabelas, seed de 2 empresas, rejeição de FK cruzada entre tenants,
 -- rejeição de overlap em reservas ativas, aceitação de intervalos adjacentes [),
--- triggers updated_at e unicidade de contato por empresa.
+-- triggers updated_at, unicidade de contato por empresa, acesso deny-by-default,
+-- trilha de auditoria imutável e consistência do snapshot de duração.
+--
+-- Transacional e repetível: o arquivo abre BEGIN e encerra com ROLLBACK depois
+-- de finish(), então os inserts/updates dos testes nunca persistem — é possível
+-- rodar `supabase test db` quantas vezes seguidas quiser sem `db reset` no meio.
+begin;
 
-select plan(17);
+select plan(28);
+
+-- Auxílio do teste comportamental de grants: roda a sonda como `anon` dentro de
+-- uma subtransação (throws_ok usa bloco de exceção), então o `set local role` é
+-- desfeito no rollback do savepoint — o restante do teste continua como postgres.
+create function pg_temp.probe_as_anon_select_tenants()
+returns bigint
+language plpgsql
+as $$
+begin
+  set local role anon;
+  return (select count(*) from public.tenants);
+end;
+$$;
 
 -- ---------------------------------------------------------------------------
 -- 1 · Estrutura: as 10 tabelas núcleo existem
@@ -214,4 +233,87 @@ select is(
   'reserva guarda snapshot de nome, preço (centavos) e moeda'
 );
 
+-- ---------------------------------------------------------------------------
+-- 11 · Snapshot de duração bate com o intervalo gravado (revisão #6)
+-- ---------------------------------------------------------------------------
+select throws_ok(
+  $$
+  insert into public.appointments
+    (tenant_id, customer_id, professional_id, service_id, starts_at, ends_at,
+     status, service_name, service_duration_minutes, price_cents, currency)
+  values
+    ('11111111-1111-4111-8111-111111111111',
+     'dddddddd-0000-4000-8000-000000000001',
+     'bbbbbbbb-0000-4000-8000-000000000001',
+     'cccccccc-0000-4000-8000-000000000001',
+     now() + interval '90 days', now() + interval '90 days 40 minutes',
+     'confirmed', 'Corte', 10, 4500, 'BRL')  -- 40 min de intervalo, snapshot 10
+  $$,
+  '23514', null,
+  'snapshot de duração divergente do intervalo da reserva é rejeitado'
+);
+
+-- ---------------------------------------------------------------------------
+-- 12 · Acesso negado por padrão até a issue #3 (revisão #6)
+-- ---------------------------------------------------------------------------
+select is(
+  (select count(*)::int from pg_class c
+     join pg_namespace n on n.oid = c.relnamespace
+    where n.nspname = 'public' and c.relkind = 'r' and c.relrowsecurity
+      and c.relname = any(array[
+        'tenants','memberships','professionals','services','professional_services',
+        'weekly_availability','schedule_exceptions','customers','appointments','audit_events'])),
+  10,
+  'RLS habilitado nas 10 tabelas núcleo'
+);
+
+select is(
+  (select count(*)::int from pg_policies where schemaname = 'public'),
+  0,
+  'nenhuma política ainda: deny-by-default até a issue #3'
+);
+
+select is(
+  (select count(*)::int from information_schema.role_table_grants
+    where table_schema = 'public' and grantee in ('anon', 'authenticated')),
+  0,
+  'anon/authenticated sem nenhuma permissão de tabela no schema public'
+);
+
+-- Teste comportamental (não só catálogo): sob `anon`, a SELECT real falha.
+select throws_ok(
+  'select pg_temp.probe_as_anon_select_tenants()',
+  '42501', null,
+  'sessão anon não consegue nem contar tenants (deny-by-default efetivo)'
+);
+
+-- Mesma asserção via catálogo, cobrindo escrita e o papel authenticated
+select is(has_table_privilege('authenticated', 'public.appointments', 'insert'), false,
+  'authenticated sem INSERT em appointments');
+select is(has_function_privilege('anon', 'public.set_updated_at()', 'execute'), false,
+  'anon sem EXECUTE nas funções do schema public');
+
+-- ---------------------------------------------------------------------------
+-- 13 · audit_events é append-only (revisão #6)
+-- ---------------------------------------------------------------------------
+select throws_ok(
+  $$
+  update public.audit_events
+     set action = 'delete'
+   where id = (select id from public.audit_events limit 1)
+  $$,
+  '42501', null,
+  'UPDATE em audit_events é rejeitado pela trilha append-only'
+);
+
+select throws_ok(
+  $$
+  delete from public.audit_events
+   where id = (select id from public.audit_events limit 1)
+  $$,
+  '42501', null,
+  'DELETE em audit_events é rejeitado pela trilha append-only'
+);
+
 select * from finish();
+rollback;
