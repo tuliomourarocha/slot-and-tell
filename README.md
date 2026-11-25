@@ -2,7 +2,7 @@
 
 Agendamento multiempresa para barbearias, salões, estúdios e clínicas, com portal web e atendimento por WhatsApp. Especificação completa em [`spec.md`](./spec.md).
 
-Este estado do repositório corresponde à **Fase 1 · Fundação (issue #1)**: projeto Next.js + TypeScript com estrutura de módulos. Ainda não há funcionalidade de produto.
+Este estado do repositório corresponde à **Fase 1 · Fundação**: scaffold Next.js + TypeScript (issue #1) e schema base do banco com seed multi-tenant (issue #6). Ainda não há funcionalidade de produto.
 
 ## Requisitos
 
@@ -70,6 +70,62 @@ A regra é imposta pelo ESLint (`npm run lint`) em `eslint.config.mjs`, com `no-
 ## Variáveis de ambiente
 
 Veja `.env.example`. Nenhum valor real é versionado. Somente `NEXT_PUBLIC_*` vai ao navegador; chaves privilegiadas e segredos ficam restritos ao servidor. Arquivos `.env*` (exceto `.env.example`) são ignorados pelo Git.
+
+## Banco de dados (Supabase)
+
+Migrations versionadas em `supabase/migrations/` e seed de desenvolvimento em `supabase/seed.sql` (issue #6). Schema base multi-tenant com 10 tabelas:
+
+| Tabela | Papel |
+|---|---|
+| `tenants` | Empresa: fuso IANA, moeda, passo de oferta, política de cancelamento |
+| `memberships` | Vínculo usuário Auth ↔ empresa (`admin`, `receptionist`, `professional`), profissional opcional |
+| `professionals` / `services` / `professional_services` | Equipe, catálogo (duração em minutos, preço em centavos, arquivamento sem apagar) e habilitações |
+| `weekly_availability` / `schedule_exceptions` | Expediente e pausas em hora local; folgas, bloqueios e turnos extras por data |
+| `customers` | Nome opcional, contato E.164 único por empresa |
+| `appointments` | Reservas em `timestamptz` com `tstzrange '[)'`, snapshots de serviço e exclusão GiST contra overlap de reservas ativas (`pending`/`confirmed`) |
+| `audit_events` | Trilha append-only de mutações |
+
+Isolamento entre tenants é garantido no banco por FKs compostas `(tenant_id, id)`: uma reserva ou vínculo jamais referencia cliente, profissional ou serviço de outra empresa.
+
+### Política de acesso (RLS)
+
+A migration já deixa as 10 tabelas em **deny-by-default**: RLS habilitado sem nenhuma política e `revoke` de `PUBLIC`/`anon`/`authenticated` em tabelas e funções do schema. Os defaults também negam acesso em tabelas futuras de `public` e em funções criadas pelo papel que executa as migrations; para funções, a revogação é global porque o PostgreSQL concede `EXECUTE` a `PUBLIC` por padrão e um revoke por schema não remove esse default. Ou seja, mesmo antes da issue #3 as chaves expostas ao navegador (`anon`) não leem nem escrevem nada — e `service_role` (servidor) mantém o acesso legítimo. As **políticas por papel** (admin/recepção/profissional e acesso do portal) chegam na **issue #3**, que adicionará `GRANT`+policies juntos; até lá não há superfície exposta a fechar.
+
+Regras estruturais já fixadas nesta migration: `audit_events` é append-only (trigger rejeita UPDATE/DELETE e `tenant_id` tem `on delete restrict`, sem cascade silencioso do histórico); `memberships` pareia papel e profissional em ambos os sentidos com no máximo um login por profissional; o snapshot de duração em `appointments` é checado contra `ends_at - starts_at`; e `btree_gist` (extensão oficial usada pelo `EXCLUDE` de conflito) é suportada pelo Supabase, instalada no schema `extensions`.
+
+### subir e resetar o banco local
+
+```bash
+docker start docker >/dev/null 2>&1 || true   # Docker Desktop/daemon ativo
+supabase start          # primeira execução baixa imagens do Supabase
+supabase db reset       # aplica migrations + seed (duas empresas de exemplo)
+```
+
+A saída de `supabase start` lista as credenciais locais (Studio, URL do Postgres, chaves `anon`/`service_role` de desenvolvimento) — nada disso é versionado.
+
+### Seed: duas empresas de exemplo
+
+Política do seed: é **local/DEV only** e **idempotente**. (a) Guarda no topo do arquivo aborta a execução quando a sessão usa TLS (`pg_stat_ssl.ssl = true`), critério de "projeto remoto": conexões à Supabase Cloud (direta ou pooler) sempre usam TLS. O seed automático do CLI local (`supabase db reset`/`start`) e `psql` via socket local não usam TLS e passam. Não se usa loopback/IP como critério (dentro do contêiner o servidor vê o IP da rede Docker). Limite honesto: um `psql` sem TLS apontando para um banco próprio que espelhe produção não é bloqueado — mirar o banco certo é responsabilidade de quem executa. (b) Reaplicar sobre banco já semeado não duplica nem erra: `on conflict do nothing` com UUIDs/chaves naturais determinísticas em todas as tabelas e `NOT EXISTS` onde não há chave natural (expediente, exceções). Como as datas de exceções/reservas são relativas a "hoje" e não são re-ancoradas em reaplicação, use `supabase db reset` para re-gerar o seed com a data atual.
+
+- **Barbearia Vila Nova** — passo 15 min, cancelamento 120 min; 3 profissionais (Marina não tem login), 4 serviços (1 arquivado), expediente seg–sáb com pausa, exceções de folga/bloqueio/extra, 3 clientes e 5 reservas (inclui par adjacente 10:00–10:40 e 10:40–11:10).
+- **Clínica Bem Estar** — passo 30 min, cancelamento 1440 min; 2 profissionais, 3 serviços, expediente seg–sex, 2 clientes e 2 reservas.
+
+Usuários de desenvolvimento (senha fixa `slot-and-tell-dev`, **somente stack local**):
+
+| E-mail | Papel |
+|---|---|
+| `dev.admin@barbearia.example` | admin da barbearia |
+| `dev.recepcao@barbearia.example` | recepção da barbearia |
+| `dev.profissional@barbearia.example` | profissional (Rafa) |
+| `dev.admin@clinica.example` | admin da clínica |
+
+### verificação local reproduzível
+
+```bash
+supabase test db        # pgTAP: supabase/tests/database/schema_seed.test.sql
+```
+
+Os 30 asserts (`plan(30)`) cobrem o DoD da issue #6: estrutura das 10 tabelas, seed com 2 empresas em BRL/`America/Sao_Paulo`, rejeição de FK cruzada entre tenants, rejeição de overlap em reservas ativas, aceitação de intervalos adjacentes `[)`, `trigger updated_at`, unicidade de contato por empresa, snapshot de duração consistente, acesso deny-by-default (RLS nas 10 tabelas, zero políticas, zero grants para `anon`/`authenticated`, sonda real como `anon`, `EXECUTE` negado a `PUBLIC` em todas as funções de `public` e em função nova criada depois — default privileges) e trilha `audit_events` imutável (UPDATE, DELETE e TRUNCATE rejeitados). Idempotência do seed não é coberta pelo pgTAP (o arquivo não executa `seed.sql`); ver verificação manual abaixo. Os testes são **transacionais e repetíveis**: o arquivo abre `BEGIN` e encerra com `ROLLBACK` após `finish()`, então nenhum insert/update dos testes persiste — `supabase test db` pode rodar em sequência sem `db reset` no meio.
 
 ## Validação do webhook da Meta e Supabase
 
