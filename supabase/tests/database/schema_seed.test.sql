@@ -11,7 +11,7 @@
 -- rodar `supabase test db` quantas vezes seguidas quiser sem `db reset` no meio.
 begin;
 
-select plan(28);
+select plan(30);
 
 -- Auxílio do teste comportamental de grants: roda a sonda como `anon` dentro de
 -- uma subtransação (throws_ok usa bloco de exceção), então o `set local role` é
@@ -291,7 +291,45 @@ select throws_ok(
 select is(has_table_privilege('authenticated', 'public.appointments', 'insert'), false,
   'authenticated sem INSERT em appointments');
 select is(has_function_privilege('anon', 'public.set_updated_at()', 'execute'), false,
-  'anon sem EXECUTE nas funções do schema public');
+  'anon sem EXECUTE em public.set_updated_at()');
+
+-- PUBLIC (pseudo-role, grantee = 0 em aclexplode) não pode ter EXECUTE em
+-- nenhuma função do schema public. acldefault cobre proacl NULL (padrão do PG,
+-- que concede EXECUTE a PUBLIC).
+select is(
+  (select count(*)::int
+     from pg_proc p
+     join pg_namespace n on n.oid = p.pronamespace,
+          aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a
+    where n.nspname = 'public'
+      and a.grantee = 0
+      and a.privilege_type = 'EXECUTE'),
+  0,
+  'PUBLIC sem EXECUTE em nenhuma função do schema public'
+);
+
+-- Default privileges: função criada depois pelo papel da migration nasce sem
+-- EXECUTE para PUBLIC/anon. Criada dentro da transação do teste (rollback no fim).
+create function public.tmp_default_privileges_probe()
+returns int
+language sql
+as $$ select 1 $$;
+
+select is(
+  (select count(*)::int
+     from pg_proc p
+     join pg_namespace n on n.oid = p.pronamespace,
+          aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a
+    where n.nspname = 'public'
+      and p.proname = 'tmp_default_privileges_probe'
+      and a.grantee = 0
+      and a.privilege_type = 'EXECUTE'),
+  0,
+  'default privileges: função nova no public não nasce com EXECUTE para PUBLIC'
+);
+
+select is(has_function_privilege('anon', 'public.tmp_default_privileges_probe()', 'execute'), false,
+  'default privileges: função nova no public não é executável por anon');
 
 -- ---------------------------------------------------------------------------
 -- 13 · audit_events é append-only (revisão #6)
@@ -313,6 +351,13 @@ select throws_ok(
   $$,
   '42501', null,
   'DELETE em audit_events é rejeitado pela trilha append-only'
+);
+
+-- TRUNCATE não passa por triggers de linha: o gate de statement deve bloquear
+select throws_ok(
+  'truncate public.audit_events',
+  '42501', null,
+  'TRUNCATE em audit_events é rejeitado pelo gate de statement'
 );
 
 select * from finish();

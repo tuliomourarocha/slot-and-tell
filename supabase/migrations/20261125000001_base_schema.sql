@@ -391,18 +391,23 @@ alter table public.customers            enable row level security;
 alter table public.appointments         enable row level security;
 alter table public.audit_events         enable row level security;
 
--- sem permissões de objeto para os papéis expostos pela API pública
-revoke all on all tables in schema public from anon, authenticated;
+-- sem permissões de objeto para os papéis expostos pela API pública.
+-- PUBLIC é o pseudo-role: EXECUTE em funções é concedido a PUBLIC por padrão, e
+-- anon/authenticated herdam dele. Revogar só de anon/authenticated NÃO basta.
+revoke all on all tables in schema public from public, anon, authenticated;
 
 -- funções do schema public (set_updated_at, gates de auditoria) também nascem
--- sem EXECUTE para os papéis da API pública — RPCs futuras da agenda serão
--- concedidas explicitamente junto das políticas na issue #3
-revoke execute on all functions in schema public from anon, authenticated;
+-- sem EXECUTE para PUBLIC e para os papéis da API pública — RPCs futuras da
+-- agenda serão concedidas explicitamente junto das políticas na issue #3
+revoke all on all functions in schema public from public, anon, authenticated;
 
 -- futuras tabelas do schema public (portal, agenda, WhatsApp) nascem negadas
--- até #3 e afins conceder GRANTs explícitos junto das políticas
-alter default privileges in schema public revoke all on tables from anon, authenticated;
-alter default privileges in schema public revoke all on functions from anon, authenticated;
+-- para PUBLIC, anon e authenticated até #3 e afins concederem GRANTs explícitos
+-- junto das políticas. Para funções, o PostgreSQL concede EXECUTE globalmente
+-- a PUBLIC por padrão; revogar por schema não remove esse default, então a
+-- revogação precisa ser global para o papel que executa as migrations.
+alter default privileges in schema public revoke all on tables from public, anon, authenticated;
+alter default privileges revoke all on functions from public, anon, authenticated;
 
 -- ---------------------------------------------------------------------------
 -- Comentários (documentação embutida no schema)
