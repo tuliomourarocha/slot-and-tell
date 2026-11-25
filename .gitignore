@@ -17,3 +17,7 @@ coverage/
 # Logs e OS
 npm-debug.log*
 .DS_Store
+
+# Supabase (local)
+supabase/.temp/
+supabase/.branches/
