@@ -268,16 +268,16 @@ select is(
 );
 
 select is(
-  (select count(*)::int from pg_policies where schemaname = 'public'),
-  0,
-  'nenhuma política ainda: deny-by-default até a issue #3'
+  (select count(distinct tablename)::int from pg_policies where schemaname = 'public'),
+  10,
+  'políticas por empresa nas 10 tabelas (issue #3); suíte de isolamento em rls_isolation.test.sql'
 );
 
 select is(
   (select count(*)::int from information_schema.role_table_grants
-    where table_schema = 'public' and grantee in ('anon', 'authenticated')),
+    where table_schema = 'public' and grantee = 'anon'),
   0,
-  'anon/authenticated sem nenhuma permissão de tabela no schema public'
+  'anon segue sem nenhuma permissão de tabela no schema public'
 );
 
 -- Teste comportamental (não só catálogo): sob `anon`, a SELECT real falha.
@@ -288,8 +288,8 @@ select throws_ok(
 );
 
 -- Mesma asserção via catálogo, cobrindo escrita e o papel authenticated
-select is(has_table_privilege('authenticated', 'public.appointments', 'insert'), false,
-  'authenticated sem INSERT em appointments');
+select is(has_table_privilege('authenticated', 'public.appointments', 'delete'), false,
+  'authenticated sem DELETE em appointments (ciclo via status, issue #3)');
 select is(has_function_privilege('anon', 'public.set_updated_at()', 'execute'), false,
   'anon sem EXECUTE em public.set_updated_at()');
 
