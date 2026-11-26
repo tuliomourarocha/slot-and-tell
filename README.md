@@ -89,7 +89,35 @@ Isolamento entre tenants é garantido no banco por FKs compostas `(tenant_id, id
 
 ### Política de acesso (RLS)
 
-A migration já deixa as 10 tabelas em **deny-by-default**: RLS habilitado sem nenhuma política e `revoke` de `PUBLIC`/`anon`/`authenticated` em tabelas e funções do schema. Os defaults também negam acesso em tabelas futuras de `public` e em funções criadas pelo papel que executa as migrations; para funções, a revogação é global porque o PostgreSQL concede `EXECUTE` a `PUBLIC` por padrão e um revoke por schema não remove esse default. Ou seja, mesmo antes da issue #3 as chaves expostas ao navegador (`anon`) não leem nem escrevem nada — e `service_role` (servidor) mantém o acesso legítimo. As **políticas por papel** (admin/recepção/profissional e acesso do portal) chegam na **issue #3**, que adicionará `GRANT`+policies juntos; até lá não há superfície exposta a fechar.
+Deny-by-default em duas camadas: RLS habilitado nas 10 tabelas e `revoke` de `PUBLIC`/`anon`/`authenticated` em tabelas e funções do schema (inclusive defaults para objetos futuros). `anon` não tem grant nem política. `service_role` (servidor) mantém acesso legítimo.
+
+A **fronteira de isolamento** é o vínculo validado em `memberships` (`auth.uid()` → linha de membership da empresa), nunca um claim de "empresa ativa" no JWT. Um usuário com vínculos em várias empresas acessa cada uma onde tem membership; a escolha de empresa na UI é filtro de UX, não fronteira de segurança.
+
+Helpers de sessão (`SECURITY DEFINER`, `search_path = ''`, `EXECUTE` só para `authenticated`):
+
+- `public.has_membership(tenant_id, roles[])` — usada nas políticas; roda como dono, evitando recursão de RLS em `memberships`.
+- `public.own_professional_id(tenant_id)` — profissional da agenda vinculado ao usuário logado na empresa.
+- `public.assert_tenant_role(tenant_id, roles[])` — **padrão obrigatório de RPC privilegiada**: valida empresa e papel e levanta `42501` se negar.
+
+Matriz (tenant = linha da própria empresa; `S` select, `I` insert, `U` update, `D` delete):
+
+| Tabela | admin | receptionist | professional |
+|---|---|---|---|
+| `tenants` | S+U | S | S |
+| `memberships` | S/I/U/D | — | S (só a própria linha) |
+| `professionals` | S/I/U/D | S/I/U | S |
+| `services` | S/I/U (arquivar = U) | S/I/U | S |
+| `professional_services` | S/I/U/D | S/I/U/D | S |
+| `weekly_availability` / `schedule_exceptions` | S/I/U/D | S/I/U/D | S + I/U/D das **próprias** linhas |
+| `customers` | S/I/U/D | S/I/U/D | S |
+| `appointments` | S/I/U (sem D: ciclo via `status`) | S/I/U | S (só o próprio `professional_id`) |
+| `audit_events` | S | — | — (escrita só por `service_role`/RPC futura) |
+
+A agenda do profissional é somente leitura até a RPC transacional da agenda (decisão D3 da issue #3).
+
+**Convenção para RPCs privilegiadas (futuras):** `security invoker` por padrão, chamar `public.assert_tenant_role(...)` no início com os papéis permitidos, e conceder `EXECUTE` individualmente a `authenticated`. Nenhuma função é executável por `anon` ou `PUBLIC`.
+
+Verificação: `supabase/tests/database/rls_isolation.test.sql` cobre acesso cruzado por ID direto (SELECT/UPDATE/INSERT e mudança de `tenant_id`) entre a barbearia e a clínica nos dois sentidos, gates por papel e sessão sem usuário. Teste de API/rota Next.js com sessão real fica para o portal/login (#2/#5).
 
 Regras estruturais já fixadas nesta migration: `audit_events` é append-only (trigger rejeita UPDATE/DELETE e `tenant_id` tem `on delete restrict`, sem cascade silencioso do histórico); `memberships` pareia papel e profissional em ambos os sentidos com no máximo um login por profissional; o snapshot de duração em `appointments` é checado contra `ends_at - starts_at`; e `btree_gist` (extensão oficial usada pelo `EXCLUDE` de conflito) é suportada pelo Supabase, instalada no schema `extensions`.
 
@@ -122,10 +150,13 @@ Usuários de desenvolvimento (senha fixa `slot-and-tell-dev`, **somente stack lo
 ### verificação local reproduzível
 
 ```bash
-supabase test db        # pgTAP: supabase/tests/database/schema_seed.test.sql
+supabase test db        # pgTAP: supabase/tests/database/*.test.sql
 ```
 
-Os 30 asserts (`plan(30)`) cobrem o DoD da issue #6: estrutura das 10 tabelas, seed com 2 empresas em BRL/`America/Sao_Paulo`, rejeição de FK cruzada entre tenants, rejeição de overlap em reservas ativas, aceitação de intervalos adjacentes `[)`, `trigger updated_at`, unicidade de contato por empresa, snapshot de duração consistente, acesso deny-by-default (RLS nas 10 tabelas, zero políticas, zero grants para `anon`/`authenticated`, sonda real como `anon`, `EXECUTE` negado a `PUBLIC` em todas as funções de `public` e em função nova criada depois — default privileges) e trilha `audit_events` imutável (UPDATE, DELETE e TRUNCATE rejeitados). Idempotência do seed não é coberta pelo pgTAP (o arquivo não executa `seed.sql`); ver verificação manual abaixo. Os testes são **transacionais e repetíveis**: o arquivo abre `BEGIN` e encerra com `ROLLBACK` após `finish()`, então nenhum insert/update dos testes persiste — `supabase test db` pode rodar em sequência sem `db reset` no meio.
+- `schema_seed.test.sql` (30 asserts, `plan(30)`) — DoD da issue #6: estrutura das 10 tabelas, seed com 2 empresas em BRL/`America/Sao_Paulo`, rejeição de FK cruzada entre tenants, overlap em reservas ativas, adjacência `[)`, `trigger updated_at`, unicidade de contato por empresa, snapshot de duração, trilha `audit_events` imutável (UPDATE, DELETE e TRUNCATE rejeitados), RLS habilitado nas 10 tabelas, sonda real como `anon` e `EXECUTE` negado a `PUBLIC`. Idempotência do seed não é coberta pelo pgTAP (ver verificação manual abaixo).
+- `rls_isolation.test.sql` (48 asserts, `plan(48)`) — issue #3: catálogo de políticas/grants/helpers, acesso cruzado por ID entre barbearia e clínica nos dois sentidos, gates por papel e sessão sem `auth.uid()`.
+
+Os testes são **transacionais e repetíveis**: cada arquivo abre `BEGIN` e encerra com `ROLLBACK` após `finish()`, então nenhum insert/update dos testes persiste — `supabase test db` pode rodar em sequência sem `db reset` no meio.
 
 ## Validação do webhook da Meta e Supabase
 
