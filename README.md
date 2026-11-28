@@ -1,5 +1,7 @@
 # Agenda SaaS
 
+[![CI](https://github.com/tuliomourarocha/slot-and-tell/actions/workflows/ci.yml/badge.svg)](https://github.com/tuliomourarocha/slot-and-tell/actions/workflows/ci.yml)
+
 Agendamento multiempresa para barbearias, salões, estúdios e clínicas, com portal web e atendimento por WhatsApp. Especificação completa em [`spec.md`](./spec.md).
 
 Este estado do repositório corresponde à **Fase 1 · Fundação**: scaffold Next.js + TypeScript (issue #1) e schema base do banco com seed multi-tenant (issue #6). Ainda não há funcionalidade de produto.
@@ -27,6 +29,44 @@ npm run dev                  # http://localhost:3000
 | `npm run lint` | ESLint (`next/core-web-vitals` + `next/typescript`) + fronteiras entre módulos |
 | `npm run typecheck` | `tsc --noEmit` com TypeScript strict |
 | `npm test` | Testes unitários com Vitest (`vitest run`) |
+
+## Ambientes
+
+| Branch | Ambiente | URL padrão Vercel | Propósito |
+|---|---|---|---|
+| `main` | Produção | `slot-and-tell.vercel.app` | Release estável para usuários |
+| `develop` | Piloto | `slot-and-tell-pilot.vercel.app` | Validação de features antes do merge em `main` |
+| `feature/*` ou PR | Preview | `slot-and-tell-pr-{n}.vercel.app` | Testes isolados por PR (expiram após merge/close) |
+
+## CI / Deploy
+
+### Pré-requisitos
+
+1. **Projeto Vercel** criado e linked:
+   ```bash
+   vercel link
+   ```
+
+2. **GitHub Secrets** configurados no repositório (Settings → Secrets and variables → Actions):
+   - `VERCEL_TOKEN`: [gerar em vercel.com/account/tokens](https://vercel.com/account/tokens)
+   - `VERCEL_ORG_ID`: encontrado em Vercel Project Settings
+   - `VERCEL_PROJECT_ID`: encontrado em Vercel Project Settings
+
+3. **Branch protection** em `main`:
+   - Exigir que checks do CI passem antes de merge
+
+### Workflow
+
+**CI (lint + typecheck + test + build)**
+
+Roda em todo PR e push para `develop`/`main`. Bloqueia merge se falhar.
+
+**Preview Deploy**
+
+- Roda em cada PR (opened, synchronize, reopened)
+- Deploy automático para Vercel com URL de preview
+- Comentário automático na PR com link para o preview
+- Expiração: PR fecha ou é mergeado → preview é descartado pela Vercel
 
 ## Estrutura
 

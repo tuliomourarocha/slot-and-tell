@@ -33,3 +33,5 @@ supabase/.branches/
 /opencode.json
 /skills-lock.json
 /RTK.md
+# Artefatos locais da squad e do ACP
+/.codegraph/
