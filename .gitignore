@@ -21,3 +21,15 @@ npm-debug.log*
 # Supabase (local)
 supabase/.temp/
 supabase/.branches/
+
+# Artefatos locais instalados pela squad e pelo ACP
+/.opencode/
+/.claude/
+/.codex/
+/.agents/
+/.planning/
+/.rtk/
+/.mcp.json
+/opencode.json
+/skills-lock.json
+/RTK.md
