@@ -1,0 +1,133 @@
+/* Estados reutilizáveis do portal (PLAN, D5). Tokens via custom properties. */
+.state {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--paper);
+  padding: var(--space-6);
+  max-width: 560px;
+  margin: var(--space-6) auto;
+  text-align: center;
+}
+
+.state :global(p) {
+  color: var(--muted);
+  margin: 0;
+}
+
+.state h2 {
+  font-size: 1.125rem;
+  margin: var(--space-2) 0;
+}
+
+.state :global(ul) {
+  text-align: left;
+  color: var(--muted);
+  margin: var(--space-3) auto 0;
+  padding-left: 1.25rem;
+  max-width: 40ch;
+}
+
+.state :global(ul li) {
+  margin: var(--space-1) 0;
+}
+
+.icon {
+  display: block;
+  font-size: 1.5rem;
+  line-height: 1;
+  margin-bottom: var(--space-2);
+}
+
+.error {
+  border-color: var(--danger);
+}
+
+.conflict {
+  border-color: var(--warn);
+}
+
+.forbidden {
+  border-color: var(--warn);
+}
+
+.empty {
+  border-color: var(--border);
+}
+
+.loading {
+  border-style: dashed;
+}
+
+.actions {
+  margin-top: var(--space-4);
+  display: flex;
+  gap: var(--space-3);
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+.actionLink,
+.actionButton {
+  display: inline-block;
+  background: var(--accent);
+  color: var(--paper);
+  border: none;
+  border-radius: var(--radius);
+  padding: var(--space-2) var(--space-4);
+  text-decoration: none;
+  cursor: pointer;
+  transition: opacity 150ms ease;
+}
+
+.actionLink:hover,
+.actionButton:hover {
+  opacity: 0.9;
+}
+
+.actionButton {
+  background: var(--paper);
+  color: var(--ink);
+  border: 1px solid var(--border);
+}
+
+/* Esqueleto de carregamento (só transform/opacity, reduced-motion no global). */
+.skeleton {
+  margin: var(--space-6) auto;
+  max-width: 560px;
+  padding: var(--space-4);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  background: var(--paper);
+}
+
+.loadingLabel {
+  color: var(--muted);
+  margin: 0;
+  font-size: 0.875rem;
+}
+
+.skeletonLine {
+  height: 14px;
+  border-radius: 4px;
+  background: var(--canvas);
+  margin-bottom: var(--space-2);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.skeletonLine:nth-child(2) {
+  width: 70%;
+}
+
+.skeletonLine:nth-child(3) {
+  width: 45%;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}

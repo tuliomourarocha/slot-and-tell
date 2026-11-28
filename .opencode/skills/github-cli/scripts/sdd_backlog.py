@@ -279,23 +279,6 @@ def resolve_milestone(ref: str, create: bool = False) -> tuple[str | None, str]:
     if not create:
         titles = ", ".join(m.get("title", "") for m in ms) or "(nenhum)"
         return None, f"milestone '{ref}' não encontrada (abertas: {titles})"
-
-
-def milestone_title_for(ref: str) -> str:
-    """gh issue create espera o TÍTULO da milestone; se a ref for número, resolve para o título."""
-    ref = str(ref).strip()
-    if not ref.isdigit():
-        return ref
-    slug = repo_slug()
-    if not slug:
-        return ref
-    code, out, _ = gh_run(["api", f"repos/{slug}/milestones/{ref}"], timeout=30)
-    if code != 0:
-        return ref
-    try:
-        return str(parse_json(out).get("title") or ref)
-    except Exception:
-        return ref
     code, out, err = gh_run(["api", "-X", "POST", f"repos/{slug}/milestones", "-f", f"title={ref}"], timeout=30)
     if code != 0:
         return None, f"falha ao criar milestone '{ref}': {(out + err).strip()[:200]}"
@@ -325,7 +308,7 @@ def cmd_create_issue(args) -> None:
         if not num:
             print(f"ISSUE_FAILED: milestone inválida — {err}", file=sys.stderr)
             sys.exit(1)
-        cmd += ["--milestone", milestone_title_for(args.milestone)]
+        cmd += ["--milestone", num]
     if args.dry_run:
         print(json.dumps({"ok": True, "dry_run": True, "would": " ".join(cmd)}, ensure_ascii=False))
         return

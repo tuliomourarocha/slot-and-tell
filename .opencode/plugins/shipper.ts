@@ -4,9 +4,14 @@
  * Conceito: middleware fora do LLM que finaliza o ciclo deterministicamente.
  * Complementa hooks/guard_rails.py (per-file) e hooks/supervisor.py (pós-shipper).
  *
- * Branch/PR: `hooks/shipper.py` cria a branch de trabalho a partir de `origin/<pr_base>`
- * ATUALIZADA (default `develop`, fetch antes) e abre o PR com `--base develop --head
- * <branch>` — nunca para a main (override via env `SDD_PR_BASE`).
+ * Branch/PR: `hooks/shipper.py` SEMPRE baixa a develop (`git fetch origin <pr_base>`),
+ * atualiza a develop local (ff-only) e cria a branch de trabalho A PARTIR DA DEVELOP
+ * ATUALIZADA antes de commitar e fazer push (default `develop`; override via env
+ * `SDD_PR_BASE`) — em develop/main OU em feature branch existente (branch nova por
+ * ciclo; commits anteriores ficam na branch anterior). Commits direto na develop são
+ * movidos para a branch nova e a develop é realinhada à origin; push/PR bloqueados se
+ * a branch final for a base — nunca push direto na develop/main. PR com `--base
+ * develop --head <branch>` — nunca para a main.
  *
  * Issue GitHub: `hooks/shipper.py` valida autenticação (`gh auth status`) e, sem auth,
  * marca GITHUB_AUTH_REQUIRED (instrução de `gh auth login`); localiza a issue do ciclo
@@ -31,7 +36,15 @@
 import type { Plugin } from "@opencode-ai/plugin";
 
 const SHIPPER_REPO = process.env.SHIPPER_REPO ?? process.env.SUPERVISOR_REPO ?? "tuliomourarocha/module-sdd-commons";
+const HOOK_MARK = "⟐ hook ✓ shipper";
 let hasRun = false;
+
+function appendHookMarker(output: any, text: string) {
+  if (process.env.OBSERVABILITY_VISIBILITY === "0") return;
+  if (!output || typeof output.output !== "string") return;
+  if (output.output.includes(HOOK_MARK)) return;
+  output.output += `\n\n${text}`;
+}
 
 async function writeGuaranteeLog($: any, directory: string, entry: Record<string, any>) {
   const line = JSON.stringify(entry);
@@ -40,11 +53,12 @@ async function writeGuaranteeLog($: any, directory: string, entry: Record<string
   await $`echo '${line.replace(/'/g, "'\\''")}' >> ${directory}/.opencode/hooks/hook-audit.jsonl`.nothrow().quiet();
 }
 
-async function runShipper($: any, directory: string, client: any, trigger: string) {
+async function runShipper($: any, directory: string, client: any, trigger: string, output?: any) {
   if (hasRun) {
     await client.app.log({
       body: { service: "shipper", level: "info", message: `Shipper hook já executado (trigger ${trigger} ignorado)` },
     });
+    appendHookMarker(output, `${HOOK_MARK} — skipped (já executado, trigger ${trigger})`);
     return;
   }
 
@@ -81,7 +95,9 @@ async function runShipper($: any, directory: string, client: any, trigger: strin
     });
     // Notifica harness/agentes — será visível no próximo gate
     hasRun = false; // permite fallback agent
-    throw new Error(`🚨 HOOK_SHIPPER_ERROR: ${errMsg} — verifique hooks/shipper.py existe. Log: .planning/HOOKS.log`);
+    const m = `${HOOK_MARK} — error (hook_not_found, trigger ${trigger})`;
+    appendHookMarker(output, m);
+    throw new Error(`${m}\n🚨 HOOK_SHIPPER_ERROR: ${errMsg} — verifique hooks/shipper.py existe. Log: .planning/HOOKS.log`);
   }
 
   await client.app.log({
@@ -141,8 +157,10 @@ async function runShipper($: any, directory: string, client: any, trigger: strin
     await client.app.log({
       body: { service: "shipper", level: "error", message: failMsg },
     });
+    const m = `${HOOK_MARK} — critical (exit 2, ${duration}ms, trigger ${trigger})`;
+    appendHookMarker(output, m);
     // Alerta visível no decorrer do processo — próximo agente/harness verá erro
-    throw new Error(`🚨 HOOK_SHIPPER_CRITICAL: ${failMsg} — Log: .planning/HOOKS.log`);
+    throw new Error(`${m}\n🚨 HOOK_SHIPPER_CRITICAL: ${failMsg} — Log: .planning/HOOKS.log`);
   }
   if (exitCode !== 0 && exitCode !== 2) {
     // Erro não crítico mas deve avisar
@@ -165,7 +183,9 @@ async function runShipper($: any, directory: string, client: any, trigger: strin
       fallback_required: true,
       message: reauthMsg,
     });
-    throw new Error(`🚨 GITHUB_AUTH_REQUIRED: ${reauthMsg}`);
+    const m = `${HOOK_MARK} — github auth required (trigger ${trigger})`;
+    appendHookMarker(output, m);
+    throw new Error(`${m}\n🚨 GITHUB_AUTH_REQUIRED: ${reauthMsg}`);
   } else if (out.includes("GITHUB_SYNC_FAILED")) {
     const githubMsg = `GITHUB_SYNC_FAILED via ${trigger} — hook NÃO fechou a issue. Fallback obrigatório: harness deve acionar \`task shipper\` (minimal) com a skill \`github-cli\` carregada ANTES de qualquer operação de issues (via \`find-skills\`, query \`github issues\`; localizar e fechar a issue seguem o fluxo da skill/CLI \`sdd_backlog.py\` — nada de API crua improvisada) para localizar a issue (\`--issue\`/\`SDD_GITHUB_ISSUE\` preferível) e encerrá-la (\`close-issue <n> --comment "🚢 PR entregue — <url>"\`). Detalhe em HANDOFF.md#GITHUB_REPORT e .planning/HOOKS.log (campo github).`;
     await client.app.log({
@@ -181,7 +201,9 @@ async function runShipper($: any, directory: string, client: any, trigger: strin
     });
     // aciona o fallback de forma visível ao harness na mesma run (padrão CI_FAILED_NEEDS_FIX):
     // git/PR já concluídos — harness deve chamar `task shipper` minimal com a skill `github-cli` carregada primeiro
-    throw new Error(`🚨 GITHUB_FALLBACK_REQUIRED: ${githubMsg}`);
+    const m = `${HOOK_MARK} — github fallback required (trigger ${trigger})`;
+    appendHookMarker(output, m);
+    throw new Error(`${m}\n🚨 GITHUB_FALLBACK_REQUIRED: ${githubMsg}`);
   } else if (out.includes("GITHUB_SYNC_OK")) {
     await writeGuaranteeLog($, directory, {
       ts: new Date().toISOString(),
@@ -206,6 +228,8 @@ async function runShipper($: any, directory: string, client: any, trigger: strin
       },
     });
   }
+  const finalStatus = exitCode === 0 ? "ok" : `warn(exit ${exitCode})`;
+  appendHookMarker(output, `${HOOK_MARK} — ${finalStatus} (${duration}ms, trigger ${trigger})`);
 }
 
 export const ShipperPlugin: Plugin = async ({ $, directory, client }) => {
@@ -219,7 +243,7 @@ export const ShipperPlugin: Plugin = async ({ $, directory, client }) => {
           const agent = args?.agent ?? args?.subagent ?? input?.args?.agent ?? "";
           if (agent === "reviewer") {
             await new Promise((r) => setTimeout(r, 1500));
-            await runShipper($, directory, client, "task:reviewer");
+            await runShipper($, directory, client, "task:reviewer", output);
           }
           if (agent === "shipper") {
             await client.app.log({
@@ -240,6 +264,7 @@ export const ShipperPlugin: Plugin = async ({ $, directory, client }) => {
         }
       } catch (err: any) {
         // Garante que erro do shipper seja visível ao agente/harness no decorrer do processo
+        appendHookMarker(output, `${HOOK_MARK} — error (ver .planning/HOOKS.log)`);
         await client.app.log({
           body: { service: "shipper", level: "error", message: `🚨 Shipper hook erro visível ao agente: ${err?.message?.slice(0, 1000)} — Log: .planning/HOOKS.log` },
         });
