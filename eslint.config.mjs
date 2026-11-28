@@ -64,7 +64,15 @@ const consumerBoundaryBlock = {
 
 const config = [
   {
-    ignores: [".next/**", "node_modules/**", "coverage/**", "next-env.d.ts", ".opencode/**", "hooks/**"],
+    ignores: [
+      ".next/**",
+      "node_modules/**",
+      "coverage/**",
+      "next-env.d.ts",
+      ".opencode/**",
+      "hooks/**",
+      "supabase/.temp/**",
+    ],
   },
   ...nextVitals,
   ...nextTypescript,
