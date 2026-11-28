@@ -7,15 +7,17 @@ import type { CookieOptions } from "@supabase/ssr";
 import type { NextRequest } from "next/server";
 
 import type { Database } from "./database.types";
+import { readSupabaseEnv } from "./supabase-env";
 
 export interface MiddlewareCookieJar {
   writes: Array<{ name: string; value: string; options: CookieOptions | undefined }>;
 }
 
 export function createSupabaseMiddlewareClient(request: NextRequest, jar: MiddlewareCookieJar) {
+  const { url, publishableKey } = readSupabaseEnv();
   return createServerClient<Database>(
-    process.env.NEXT_PUBLIC_SUPABASE_URL ?? "",
-    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY ?? "",
+    url,
+    publishableKey,
     {
       cookies: {
         getAll() {
